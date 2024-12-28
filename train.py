@@ -17,17 +17,19 @@ if ddp:
     ddp_world_size = int(os.environ['WORLD_SIZE'])
     master_process = ddp_rank == 0
 
-torch.manual_seed(1337)
-#random.seed(1337)
-
 batch_size = 2640  # 3000
 block_size = 8
-n_embd = 32 
-n_head = 4
-n_layer = 4
+n_embd = 64
+n_head = 8
+n_layer = 8
 dropout = 0.2
 vocab_size = 2002
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') 
+
+if ddp:
+    batch_size = batch_size//ddp_world_size 
+    torch.manual_seed(1337 + ddp_rank)
+    random.seed(1337 + ddp_rank)
 
 class Head(nn.Module): 
     def __init__(self, head_size):
@@ -49,7 +51,6 @@ class Head(nn.Module):
         wei = self.dropout(wei)
         out = wei @ v 
         return out
-
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
@@ -142,10 +143,10 @@ if ddp:
     model = model.to(device)
     model = DDP(model, device_ids=[ddp_local_rank])
 
-optimizer = optim.AdamW(model.parameters(), lr=3e-3)
+optimizer = optim.AdamW(model.parameters(), lr=1e-4) # 3e-4
 losses = []
 
-for step in range(100000):
+for step in range(10000):
     t0 = time.time()
     qs = []
     targets = []
@@ -159,17 +160,26 @@ for step in range(100000):
         
     qs = torch.tensor(qs, device = device)
     targets = torch.tensor(targets, device = device)  
-    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        logits, loss = model(qs, targets)
+    #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+    logits, loss = model(qs, targets)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1-t0) * 1000
+    if ddp:
+        # Average loss across GPUs
+        avg_loss = loss.clone()
+        torch.distributed.all_reduce(avg_loss)
+        avg_loss = avg_loss / ddp_world_size
+        loss = avg_loss  
     losses.append(loss.item())
-    if step % 100 == 0:
-        print(f"Step {step}, Loss: {loss.item()}, dt: {dt:.2f}ms")
-print(f"Final Loss: {loss.item()}") 
+    if master_process:
+        if step % 100 == 0:
+            print(f"Step {step}, Loss: {loss.item()}, Norm: {norm: .4f}, dt: {dt:.2f}ms")
+if master_process:
+    print(f"Final Loss: {loss.item()}") 
 
 
 
@@ -181,41 +191,42 @@ correct = 0
 wrong = 0
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
-for _ in range(all):
-    q, t = DataLoader()
-    context = torch.tensor([q], device = device)  # Shape (1, T)
+if master_process:
+    for _ in range(all):
+        q, t = DataLoader()
+        context = torch.tensor([q], device = device)  # Shape (1, T)
 
- 
-    generated_sequence = raw_model.generate(context, max_new_tokens=1).tolist()
-    generated_sequence = generated_sequence[0]
     
-    #[a, 0, 0, b, 0,0,0,0]
-    generated_sequence[1] = '+'
-    
-    del generated_sequence[2]
-    del generated_sequence[3]
-    del generated_sequence[3]
-    del generated_sequence[3]
-    generated_sequence[3] = '='
-    if generated_sequence[-1] == t:
-        correct += 1
-        print("correct:")
-        print(generated_sequence)
-    else:
-        wrong += 1
-        print('wrong:')
-        print(generated_sequence)
+        generated_sequence = raw_model.generate(context, max_new_tokens=1).tolist()
+        generated_sequence = generated_sequence[0]
+        
+        #[a, 0, 0, b, 0,0,0,0]
+        generated_sequence[1] = '+'
+        
+        del generated_sequence[2]
+        del generated_sequence[3]
+        del generated_sequence[3]
+        del generated_sequence[3]
+        generated_sequence[3] = '='
+        if generated_sequence[-1] == t:
+            correct += 1
+            print("correct:")
+            print(generated_sequence)
+        else:
+            wrong += 1
+            print('wrong:')
+            print(generated_sequence)
 
-print("accuracy: ")
-print(f"{correct} out of {all}")
+    print("accuracy: ")
+    print(f"{correct} out of {all}")
 
 
 
-plt.plot(losses)
-plt.title('Training Loss Over Time')
-plt.xlabel('Step')
-plt.ylabel('Loss')
-plt.savefig('training_loss.png')
+    plt.plot(losses)
+    plt.title('Training Loss Over Time')
+    plt.xlabel('Step')
+    plt.ylabel('Loss')
+    plt.savefig('training_loss.png')
 
 
 # loss: 1.58
@@ -227,6 +238,14 @@ plt.savefig('training_loss.png')
 
 # 1000 
 # 2.326 :(
+# 1.12
 if ddp:
     destroy_process_group()
 # torchrun --standalone --nproc_per_node=2 train.py
+
+
+
+# TODO:
+# 1. Flash attention
+# 2. add other operations
+# 3. fix typo
