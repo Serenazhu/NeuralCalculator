@@ -5,18 +5,28 @@ from torch.nn import functional as F
 import torch.optim as optim
 import matplotlib.pyplot as plt  
 import time
+import os
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
 
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    master_process = ddp_rank == 0
 
 torch.manual_seed(1337)
-random.seed(1337)
+#random.seed(1337)
 
-batch_size = 264  # 3000
+batch_size = 2640  # 3000
 block_size = 8
 n_embd = 32 
 n_head = 4
 n_layer = 4
 dropout = 0.2
-vocab_size = 202
+vocab_size = 2002
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  
 
 class Head(nn.Module): 
@@ -116,8 +126,8 @@ class TransformerModel(nn.Module):
         
 # Generate batch
 def DataLoader():
-    a = random.randint(0, 100) # 101
-    b = random.randint(0, 100) # 101
+    a = random.randint(0, 1000) # 101
+    b = random.randint(0, 1000) # 101
     target = a + b             # 201
     q = [a, 0, 0, b, 0,0,0,0]
     return q, target
@@ -125,7 +135,13 @@ def DataLoader():
 torch.set_float32_matmul_precision('high')
 model = TransformerModel(vocab_size, n_embd)
 model = torch.compile(model)
-model.to(device)
+
+
+if ddp:
+    torch.cuda.set_device(ddp_local_rank)
+    model = model.to(device)
+    model = DDP(model, device_ids=[ddp_local_rank])
+
 optimizer = optim.AdamW(model.parameters(), lr=3e-3)
 losses = []
 
@@ -155,17 +171,22 @@ for step in range(100000):
         print(f"Step {step}, Loss: {loss.item()}, dt: {dt:.2f}ms")
 print(f"Final Loss: {loss.item()}") 
 
+
+
 # -------------------------------------------------
 model.eval()
 all = 100
 
 correct = 0
 wrong = 0
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
 for _ in range(all):
     q, t = DataLoader()
     context = torch.tensor([q], device = device)  # Shape (1, T)
-    generated_sequence = model.generate(context, max_new_tokens=1).tolist()
+
+ 
+    generated_sequence = raw_model.generate(context, max_new_tokens=1).tolist()
     generated_sequence = generated_sequence[0]
     
     #[a, 0, 0, b, 0,0,0,0]
@@ -203,3 +224,9 @@ plt.savefig('training_loss.png')
 #1.05
 
 # 0.28
+
+# 1000 
+# 2.326 :(
+if ddp:
+    destroy_process_group()
+# torchrun --standalone --nproc_per_node=2 train.py
