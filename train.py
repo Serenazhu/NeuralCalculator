@@ -21,7 +21,7 @@ batch_size = 2640  # 3000
 block_size = 8
 n_embd = 64
 n_head = 8
-n_layer = 8
+n_layer = 4
 dropout = 0.2
 vocab_size = 2002
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') 
@@ -63,7 +63,7 @@ class MultiHeadAttention(nn.Module):
         out = self.dropout(self.proj(out))
         return out
 
-class FeedFoward(nn.Module):
+class FeedForward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
@@ -83,7 +83,7 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
         self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedFoward(n_embd)
+        self.ffwd = FeedForward(n_embd)
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
@@ -111,8 +111,11 @@ class TransformerModel(nn.Module):
         if targets is None:
             loss = None
         else:
-            last_logits = logits[:, -1, :]  
-            loss = F.cross_entropy(last_logits, targets.long())
+            loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),  # Flatten logits
+            targets.view(-1),  # Flatten targets
+            ignore_index=-1   # Ignore positions with -1
+        )
         return logits, loss
     
     def generate(self, idx, max_new_tokens = 1):
@@ -131,7 +134,8 @@ def DataLoader():
     b = random.randint(0, 1000) # 101
     target = a + b             # 201
     q = [a, 0, 0, b, 0,0,0,0]
-    return q, target
+    t = [-1, -1,  -1, -1, -1, -1, -1, target]
+    return q, t
 
 torch.set_float32_matmul_precision('high')
 model = TransformerModel(vocab_size, n_embd)
@@ -143,10 +147,10 @@ if ddp:
     model = model.to(device)
     model = DDP(model, device_ids=[ddp_local_rank])
 
-optimizer = optim.AdamW(model.parameters(), lr=1e-4) # 3e-4
+optimizer = optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.98)) # 3e-4
 losses = []
 
-for step in range(10000):
+for step in range(100000):
     t0 = time.time()
     qs = []
     targets = []
@@ -160,8 +164,8 @@ for step in range(10000):
         
     qs = torch.tensor(qs, device = device)
     targets = torch.tensor(targets, device = device)  
-    #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-    logits, loss = model(qs, targets)
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        logits, loss = model(qs, targets)
     loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
@@ -248,4 +252,5 @@ if ddp:
 # TODO:
 # 1. Flash attention
 # 2. add other operations
-# 3. fix typo
+# 3. predict the digits of c in reverse order
+# 4. lower batch size?
